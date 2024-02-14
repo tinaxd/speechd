@@ -52,11 +52,31 @@
 DECLARE_DEBUG();
 
 MOD_OPTION_1_STR(OpenjtalkDictionaryDirectory);
-MOD_OPTION_1_STR(OpenjtalkVoice);
+
+char **voice_search_paths = NULL;
+int n_voice_search_paths = 0;
+DOTCONF_CB(VoiceFileSearchPath_cb) {
+	voice_search_paths = (char **)g_realloc(voice_search_paths, (n_voice_search_paths + 1) * sizeof *voice_search_paths);
+	voice_search_paths[n_voice_search_paths] = g_strdup(cmd->data.str);
+	++n_voice_search_paths;
+	return NULL;
+}
+
+char *openjtalk_msg_voice_str = NULL;
+char *openjtalk_msg_language = NULL;
+char *openjtalk_htsvoice_path = NULL;
 
 int module_init(char **msg)
 {
 	fprintf(stderr, "initializing\n");
+
+	if (module_list_registered_voices() == NULL)
+	{
+		*msg = g_strdup("The module does not have any voice configured, "
+					    "please add them in the configuration file, "
+					    "or install the required files");
+		return -1;
+	}
 
 	*msg = strdup("ok!");
 
@@ -70,11 +90,21 @@ int module_load(void)
 
 	MOD_OPTION_1_STR_REG(OpenjtalkDictionaryDirectory,
 			     "/var/lib/mecab/dic/open-jtalk");
-	MOD_OPTION_1_STR_REG(OpenjtalkVoice,
-			     "/usr/share/hts-voice/nitech-jp-atr503-m001/nitech_jp_atr503_m001.htsvoice");
+
+	module_dc_options = module_add_config_option(
+		module_dc_options,
+		&module_num_dc_options,
+		"VoiceFileSearchPath",
+		ARG_STR,
+		VoiceFileSearchPath_cb,
+		NULL,
+		0
+	);
 
 	DBG("OpenjtalkDictionaryDirectory: %s", OpenjtalkDictionaryDirectory);
-	DBG("OpenjtalkVoice: %s", OpenjtalkVoice);
+
+	module_register_available_voices();
+	module_register_settings_voices();
 
 	module_audio_set_server();
 
@@ -83,25 +113,82 @@ int module_load(void)
 
 SPDVoice **module_list_voices(void)
 {
-	/* TODO: Allow users to choose htsvoice */
-	SPDVoice **ret = malloc(2 * sizeof(*ret));
+	return module_list_registered_voices();
+}
 
-	ret[0] = malloc(sizeof(*(ret[0])));
-	ret[0]->name = strdup("Default");
-	ret[0]->language = strdup("ja");
-	ret[0]->variant = NULL;
+static void update_htsvoice_path()
+{
+	if (openjtalk_htsvoice_path != NULL) {
+		free(openjtalk_htsvoice_path);
+		openjtalk_htsvoice_path = NULL;
+	}
 
-	ret[1] = NULL;
+	if (openjtalk_msg_voice_str == NULL) {
+		DBG("update_htsvoice_path: openjtalk_msg_voice_str is NULL");
+		return;
+	}
 
-	return ret;
+	for (size_t i=0; i<n_voice_search_paths; i++) {
+		GString *htsvoice_path = g_string_new(voice_search_paths[i]);
+		g_string_replace(
+			htsvoice_path, "$VOICE", openjtalk_msg_voice_str, 0
+		);
+		// check if the file exists
+		if (g_file_test(htsvoice_path->str, G_FILE_TEST_EXISTS)) {
+			openjtalk_htsvoice_path = htsvoice_path->str;
+			g_string_free(htsvoice_path, 0);
+			return;
+		}
+		g_string_free(htsvoice_path, 1);
+	}
+}
+
+void openjtalk_set_voice(SPDVoiceType voice)
+{
+	DBG("Setting voice type %d", voice);
+	assert(openjtalk_msg_language);
+	openjtalk_msg_voice_str =
+	    module_getvoice(openjtalk_msg_language, voice);
+	if (openjtalk_msg_voice_str == NULL) {
+		DBG("Invalid voice type specified or no voice available!");
+	}
+	update_htsvoice_path();
+}
+
+void openjtalk_set_language(char *lang)
+{
+	DBG("Setting language %s", lang);
+	openjtalk_msg_language = lang;
+
+	openjtalk_set_voice(msg_settings.voice_type);
+}
+
+void openjtalk_set_synthesis_voice(char *name)
+{
+	DBG("Setting voice name %s (%s)", name, msg_settings.voice.name);
+	assert(msg_settings.voice.name);
+	if (module_existsvoice(msg_settings.voice.name)) {
+		openjtalk_msg_voice_str = msg_settings.voice.name;
+		update_htsvoice_path();
+	}
 }
 
 void module_speak_sync(const char *data, size_t bytes, SPDMessageType msgtype)
 {
-	module_speak_ok();
-
 	DBG("speaking '%s'", data);
 
+	/* Set Open JTalk parameters */
+	UPDATE_STRING_PARAMETER(voice.language, openjtalk_set_language);
+	UPDATE_PARAMETER(voice_type, openjtalk_set_voice);
+	UPDATE_STRING_PARAMETER(voice.name, openjtalk_set_synthesis_voice);
+
+	if (openjtalk_htsvoice_path == NULL) {
+		DBG("No voice specified");
+		module_speak_error();
+		return;
+	}
+
+	module_speak_ok();
 	module_report_event_begin();
 
 	/* Strip SSML (Open JTalk does not support it.) */
@@ -122,11 +209,13 @@ void module_speak_sync(const char *data, size_t bytes, SPDMessageType msgtype)
 	char *cmd;
 	if (asprintf(&cmd,
 		     "open_jtalk -x %s -m %s -ow %s",
-		     OpenjtalkDictionaryDirectory, OpenjtalkVoice,
+		     OpenjtalkDictionaryDirectory,
+			 openjtalk_htsvoice_path,
 		     template) == -1) {
 		DBG("failed to construct command line");
 		goto TEMPLATE_FINISH;
 	}
+	DBG("executing: %s", cmd);
 
 	FILE *oj_fp = popen(cmd, "w");
 	free(cmd);
@@ -215,6 +304,8 @@ void module_speak_sync(const char *data, size_t bytes, SPDMessageType msgtype)
 
 	module_tts_output_server(&track, format);
 
+	DBG("output finished");
+
 	free(track.samples);
 
 FP_FINISH:
@@ -227,6 +318,7 @@ FINISH:
 	free(plain_data);
 
 	module_report_event_end();
+	DBG("done");
 }
 
 size_t module_pause(void)

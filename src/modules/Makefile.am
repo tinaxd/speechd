@@ -255,7 +255,7 @@ endif
 endif
 
 modulebin_PROGRAMS += sd_openjtalk
-sd_openjtalk_SOURCES = openjtalk.c $(common_SOURCES)
+sd_openjtalk_SOURCES = openjtalk.c $(common_SOURCES) module_utils_addvoice.c
 sd_openjtalk_LDADD = $(top_builddir)/src/common/libcommon.la \
 	$(common_LDADD)
 sd_openjtalk_CPPFLAGS = $(AM_CPPFLAGS) \
